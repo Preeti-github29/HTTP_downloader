@@ -1,0 +1,231 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#define MAX_PARTS 50
+#define BUFFER_SIZE 1024
+#define h_addr h_addr_list[0]
+
+typedef struct {
+    char url[2048];
+    char output_file[256];
+    int num_parts;
+} DownloadInfo;
+
+typedef struct {
+    int part_num;
+    off_t start;
+    off_t end;
+} ThreadInfo;
+
+void error(const char *msg) {
+    perror(msg);
+    exit(1);
+}
+
+void* download_part(void *arg) {
+    ThreadInfo *thread_info = (ThreadInfo *)arg;
+
+    SSL_CTX *ctx;
+    SSL *ssl;
+    int sockfd;
+
+    SSL_library_init();
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        ERR_print_errors_fp(stderr);
+        pthread_exit(NULL);
+    }
+
+    // Initialize TCP connection
+    struct hostent *server = gethostbyname("cobweb.cs.uga.edu");
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(443);
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        error("Error connecting to server");
+    }
+
+    // Initialize SSL connection
+    ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sockfd);
+    if (SSL_connect(ssl) < 0) {
+        ERR_print_errors_fp(stderr);
+        pthread_exit(NULL);
+    }
+
+    // Prepare HTTP request
+    char request[2048];
+    sprintf(request, "GET %s HTTP/1.1\r\nRange: bytes=%ld-%ld\r\nHost: cobweb.cs.uga.edu\r\nConnection: close\r\n\r\n",
+            "/~perdisci/CSCI6760-F21/Project2-TestFiles/topnav-sport2_r1_c1.gif",
+            thread_info->start, thread_info->end);
+
+    // Send HTTP request
+    if (SSL_write(ssl, request, strlen(request)) < 0) {
+        error("Error writing to socket");
+    }
+
+    // Receive HTTP response and save the part
+    char buffer[BUFFER_SIZE];
+    sprintf(buffer, "part_%d", thread_info->part_num);
+    FILE *part_file = fopen(buffer, "wb");
+    if (part_file == NULL) {
+        error("Error opening part file");
+    }
+
+    int bytes_received;
+    while ((bytes_received = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+        fwrite(buffer, 1, bytes_received, part_file);
+    }
+
+    fclose(part_file);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(sockfd);
+
+    pthread_exit(NULL);
+}
+
+void merge_parts(char *output_file, int num_parts) {
+    FILE *output = fopen(output_file, "wb");
+    if (output == NULL) {
+        error("Error opening output file");
+    }
+    char header[] = "GIF89a";
+    fwrite(header, 1, sizeof(header) - 1, output);
+
+    // You may need to adjust the following part based on the actual structure of your GIF
+    char logical_screen_descriptor[7];
+    // Populate logical_screen_descriptor appropriately (depends on the GIF structure)
+    fwrite(logical_screen_descriptor, 1, sizeof(logical_screen_descriptor), output);
+
+    for (int i = 1; i <= num_parts; i++) {
+        char part_file[256];
+        sprintf(part_file, "part_%d", i);
+
+        FILE *part = fopen(part_file, "rb");
+        if (part == NULL) {
+            error("Error opening part file");
+        }
+
+        fseek(part, sizeof(header) + sizeof(logical_screen_descriptor), SEEK_SET);
+        char buffer[BUFFER_SIZE];
+        int bytes_read;
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), part)) > 0) {
+            fwrite(buffer, 1, bytes_read, output);
+        }
+
+        fclose(part);
+    }
+
+    fclose(output);
+}
+
+off_t get_content_length(const char *url) {
+    SSL_CTX *ctx;
+    SSL *ssl;
+    int sockfd;
+
+    SSL_library_init();
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+    // Initialize TCP connection
+    struct hostent *server = gethostbyname("cobweb.cs.uga.edu");
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(443);
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        error("Error connecting to server");
+    }
+
+    // Initialize SSL connection
+    ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sockfd);
+    if (SSL_connect(ssl) < 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+    // Prepare HEAD request
+    char request[2048];
+    sprintf(request, "HEAD %s HTTP/1.1\r\nHost: cobweb.cs.uga.edu\r\nConnection: close\r\n\r\n", url);
+
+    // Send HEAD request
+    if (SSL_write(ssl, request, strlen(request)) < 0) {
+        error("Error writing to socket");
+    }
+
+    // Receive and parse headers
+    char buffer[BUFFER_SIZE];
+    off_t content_length = 0;
+    while (SSL_read(ssl, buffer, sizeof(buffer)) > 0) {
+        // Assuming Content-Length is present in the headers
+        char *content_length_str = strstr(buffer, "Content-Length:");
+        if (content_length_str != NULL) {
+            content_length = atoll(content_length_str + strlen("Content-Length:"));
+            break;
+        }
+    }
+
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(sockfd);
+
+    return content_length;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 7 || strcmp(argv[1], "-u") != 0 || strcmp(argv[3], "-o") != 0 || strcmp(argv[5], "-n") != 0) {
+        fprintf(stderr, "Usage: %s -u HTTPS_URL -o OUTPUT_FILE -n NUM_PARTS\n", argv[0]);
+        exit(1);
+    }
+
+    DownloadInfo download_info;
+    strcpy(download_info.url, argv[2]);
+    strcpy(download_info.output_file, argv[4]);
+    download_info.num_parts = atoi(argv[6]);
+
+    off_t total_size = get_content_length(download_info.url);
+
+    pthread_t threads[MAX_PARTS];
+    ThreadInfo thread_info[MAX_PARTS];
+
+    off_t part_size = total_size / download_info.num_parts;
+    off_t remaining_bytes = total_size % download_info.num_parts;
+
+    for (int i = 0; i < download_info.num_parts; i++) {
+        thread_info[i].part_num = i + 1;
+        thread_info[i].start = i * part_size;
+        thread_info[i].end = (i + 1) * part_size - 1 + (i == download_info.num_parts - 1 ? remaining_bytes : 0);
+
+        if (pthread_create(&threads[i], NULL, download_part, (void *)&thread_info[i]) != 0) {
+            error("Error creating thread");
+        }
+    }
+
+    for (int i = 0; i < download_info.num_parts; i++) {
+        if (pthread_join(threads[i], NULL) != 0) {
+            error("Error joining thread");
+        }
+    }
+
+    merge_parts(download_info.output_file, download_info.num_parts);
+
+    return 0;
+}
